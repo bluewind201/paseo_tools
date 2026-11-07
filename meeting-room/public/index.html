@@ -85,6 +85,8 @@ svg.m .head{transform-origin:50px 62px;animation:tilt 5s ease-in-out infinite}
 .agent[data-s=working] .dot{background:#1f9d6b}
 .agent[data-s=blocked] .dot{background:#e8a33d}
 .agent[data-s=failed] .dot{background:#c44}
+.agent[data-s=quota] .dot{background:#c44;box-shadow:0 0 0 3px rgba(204,68,68,.25)}
+.agent[data-s=quota] svg.m{filter:grayscale(.6) opacity(.75)}
 .agent[data-s=done] .dot{background:#3a86d4}
 .bubble{position:absolute;bottom:calc(var(--s)*var(--k)*100px + 8px);left:50%;transform:translateX(-50%) scale(.9);opacity:0;transition:opacity .25s,transform .25s;z-index:1;
   width:max-content;max-width:210px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:6px 10px;font-size:12px;line-height:1.4;box-shadow:var(--shadow);pointer-events:none}
@@ -177,7 +179,7 @@ const TABLE = { x: 50, y: 52, rx: 21, ry: 19 }
 // Stand in front of back-row desks, behind front-row desks (desk then hides the lower body).
 const atDesk = ([x, y]) => [x, y > 60 ? y - 13 : y + 14]
 function seatAt(i, n) {
-  const a = (Math.PI * 2 * i) / Math.max(n, 1) + (n === 2 ? Math.PI : -Math.PI / 2) // a pair sits left and right
+  const a = (Math.PI * 2 * i) / Math.max(n, 1) + (n === 2 ? Math.PI : Math.PI + Math.PI / n) // keep seats off the top/bottom, where desk agents stand
   return [TABLE.x + Math.cos(a) * (TABLE.rx + 6), TABLE.y + Math.sin(a) * (TABLE.ry + 7)]
 }
 const WALL = 26
@@ -275,12 +277,16 @@ let OBJECTIVE = ''
 // ---------- roles ----------
 function roleFor(text) {
   const t = (text || '').toLowerCase()
-  for (const r of ROLES.roles) if ((r.match || []).some((w) => t.includes(String(w).toLowerCase()))) return r
-  return null
+  const words = (r, loose) => (r.match || []).map((w) => String(w).toLowerCase().replace(/[\[\]]/g, '')).filter((w) => !loose || !/^[a-z]{1,3}$/.test(w))
+  // Outside the [tag], skip short English words so "npm" doesn't read as "pm".
+  const hit = (s, loose) => ROLES.roles.find((r) => words(r, loose).some((w) => s.includes(w)))
+  // The leading [tag] decides first, so "[리뷰] 개발 변경 검토" is a review, not dev.
+  const tag = t.match(/^\s*\[([^\]]+)\]/)?.[1]
+  return (tag && hit(tag)) || hit(t, true) || null
 }
 function roleById(id) { return ROLES.roles.find((r) => r.id === id) || ROLES.fallback }
 const roleForProvider = (p) => ROLES.roles.find((r) => r.provider === p)
-const AGENT_LABEL = { claude: 'Claude', codex: 'Codex', gemini: 'Gemini', opencode: 'OpenCode', copilot: 'Copilot', pi: 'Pi' }
+const AGENT_LABEL = { claude: 'Claude', codex: 'Codex', gemini: 'Gemini', antigravity: 'Antigravity', opencode: 'OpenCode', copilot: 'Copilot', pi: 'Pi' }
 const agentName = (p) => AGENT_LABEL[p] || p || ''
 const short = (t, n = 14) => { t = String(t || '').replace(/\s+/g, ' ').trim(); return t.length > n ? t.slice(0, n - 1) + '…' : t }
 const baseName = (p) => String(p || '').replace(/\/+$/, '').split('/').pop() || p
@@ -288,14 +294,16 @@ const wsKey = (a) => a.workspaceId || a.cwd
 const OWNER = () => ({ id: 'owner', name: ROLES.owner?.name || '사장님', emoji: ROLES.owner?.emoji || '🙋', color: '#f6b13a' })
 
 // ---------- model (Paseo agents + timeline events) ----------
+const QUOTA = /usage limit|rate.?limit|quota|429|exhaust|insufficient|credit|사용량|한도/i
 function agentStatus(a) {
+  if (a.lastError && QUOTA.test(a.lastError)) return 'quota'
   if (a.permissions || a.attention === 'permission') return 'blocked'
   if (a.status === 'running' || a.status === 'initializing') return 'working'
   if (a.status === 'error' || a.attention === 'error') return 'failed'
   if (a.status === 'closed' || a.say) return 'done'
   return 'idle'
 }
-const TASK_STATUS = { working: 'dispatched', blocked: 'blocked', failed: 'failed', done: 'completed', idle: 'pending' }
+const TASK_STATUS = { working: 'dispatched', blocked: 'blocked', failed: 'failed', quota: 'quota', done: 'completed', idle: 'pending' }
 const REVIEW = /리뷰|review|검토/i
 
 function buildModel(live) {
@@ -304,14 +312,16 @@ function buildModel(live) {
   const events = live.events || []
   const byId = new Map()
   const members = agents.map((a) => {
-    const role = roleFor(a.title) || roleForProvider(a.provider) || ROLES.fallback
+    const leads = all.some((x) => x.parentId === a.id)
+    // Roles follow the title tag, not the AI: any AI can take any role.
+    const role = roleFor(a.title) || (leads && !a.parentId ? roleById(ROLES.coordinatorRole) : ROLES.fallback)
     const status = agentStatus(a)
     const lastIn = [...events].reverse().find((e) => e.to === a.id && (e.kind === 'msg' || e.kind === 'user'))
     const reviewing = role.id === 'dev' && (REVIEW.test(a.title || '') || (status === 'working' && REVIEW.test(lastIn?.text || '')))
     const m = { key: a.id, agent: a, role, label: short(String(a.title || '').replace(/^\s*\[[^\]]*\]\s*/, '') || agentName(a.provider)), agents: new Set([agentName(a.provider)]), status, reviewing,
-      coordinator: !a.parentId && (role.id === ROLES.coordinatorRole || all.some((x) => x.parentId === a.id)),
+      coordinator: !a.parentId && (role.id === ROLES.coordinatorRole || leads), standby: /대체|backup/i.test(a.title || ''),
       tasks: [{ id: a.id, task_title: a.title || '(제목 없음)', status: TASK_STATUS[status], role, worker: { agent: a.provider }, reviewing,
-        now: a.tool ? '🔧 ' + a.tool : status === 'blocked' ? '✋ 승인을 기다리는 중' : '', result: a.lastError || a.say }] }
+        now: status === 'quota' ? '⛽ 사용량 초과 – 다른 AI로 대체 필요' : a.tool ? '🔧 ' + a.tool : status === 'blocked' ? '✋ 승인을 기다리는 중' : '', result: a.lastError || a.say }] }
     byId.set(a.id, m)
     return m
   })
@@ -373,7 +383,7 @@ function renderOffice(model) {
     }
     el.style.setProperty('--c', m.role.color)
     el.dataset.s = m.status
-    el.querySelector('.name').textContent = (m.label || m.role.name) + (m.coordinator ? ' (리드)' : m.reviewing ? ' (리뷰 중)' : '')
+    el.querySelector('.name').textContent = (m.label || m.role.name) + (m.coordinator ? ' (리드)' : m.standby ? ' (대체)' : m.reviewing ? ' (리뷰 중)' : '')
     const badge = [...m.agents].join('·')
     el.querySelector('.badge').textContent = badge; el.querySelector('.badge').hidden = !badge
     const mi = meeting.indexOf(m)
@@ -381,7 +391,7 @@ function renderOffice(model) {
   })
   for (const [id, el] of agentEls) if (!ids.includes(id)) { el.remove(); agentEls.delete(id) }
   $('#tableLabel').textContent = meeting.length >= 2 ? `회의 중 · ${meeting.length}명` : '회의 테이블'
-  $('#legend').innerHTML = model.members.map((m) => `<span style="--c:${m.role.color}">${m.label ? m.label + ' (' + m.role.name + ')' : m.role.name}${m.agents.size ? ' – ' + [...m.agents].join(', ') : ''}</span>`).join('')
+  $('#legend').innerHTML = model.members.map((m) => `<span style="--c:${m.role.color}">${m.label ? m.label + ' (' + m.role.name + (m.standby ? '·대체' : '') + ')' : m.role.name}${m.agents.size ? ' – ' + [...m.agents].join(', ') : ''}</span>`).join('')
 }
 
 const LIM = () => (stage.clientWidth < 520 ? 44 : 90)
@@ -403,8 +413,8 @@ function fly(fromId, toId) {
 }
 
 // ---------- side panels ----------
-const COLS = [['진행 중', ['dispatched']], ['승인 대기', ['blocked']], ['대기', ['pending']], ['답변 완료', ['completed']], ['오류', ['failed']]]
-const STATUS_KO = { pending: '대기', dispatched: '진행 중', blocked: '승인 대기', completed: '답변 완료', failed: '오류' }
+const COLS = [['진행 중', ['dispatched']], ['승인 대기', ['blocked']], ['⛽ 사용량 초과', ['quota']], ['대기', ['pending']], ['답변 완료', ['completed']], ['오류', ['failed']]]
+const STATUS_KO = { pending: '대기', dispatched: '진행 중', blocked: '승인 대기', quota: '사용량 초과', completed: '답변 완료', failed: '오류' }
 function renderBoard(model) {
   const tasks = model.members.flatMap((m) => m.tasks)
   if (!tasks.length) { $('#board').innerHTML = '<p class="none">아직 작업이 없어요.</p>'; return }
@@ -481,21 +491,25 @@ async function tick() {
 
 // ---------- demo ----------
 const demo = (() => {
-  const A = { pm: ['gemini', '[PM] 카페 예약 랜딩 페이지'], dev: ['claude', '[개발] 예약 폼과 API'], design: ['codex', '[디자인] 메인 화면 시안'] }
+  const A = { pm: ['antigravity', '[PM] 카페 예약 랜딩 페이지'], dev: ['claude', '[개발] 예약 폼과 API'], design: ['codex', '[디자인] 메인 화면 시안'],
+    dev2: ['codex', '[개발·대체] 예약 폼과 API'], review: ['antigravity', '[리뷰] 랜딩 페이지 검토'] }
   const script = [
-    ['agent', 'pm'], ['user', 'pm', '목표: 카페 예약 랜딩 페이지 만들기\n너는 이 프로젝트의 PM이야…'], ['run', 'pm', 'Gemini가 계획 세우는 중'],
-    ['say', 'pm', '작업을 개발과 디자인 두 갈래로 나눌게요. 디자인 시안이 먼저 나오면 개발이 이어받아요.'],
-    ['agent', 'design'], ['msg', 'pm', 'design', '[디자인] 메인/예약/완료 3화면 시안을 design/ 폴더에 만들어줘. 끝나면 나에게 알려줘.'], ['run', 'design', 'Write – design/main.html'],
-    ['agent', 'dev'], ['msg', 'pm', 'dev', '[개발] 예약 폼과 /api/reserve를 구현해줘. 디자인 토큰은 디자이너에게 직접 물어봐도 돼.'], ['run', 'dev', 'Read – package.json'],
+    ['agent', 'pm'], ['user', 'pm', '목표: 카페 예약 랜딩 페이지 만들기\n너는 이 프로젝트의 PM이야…'], ['run', 'pm', 'Bash – paseo usage --refresh'],
+    ['say', 'pm', '사용량 확인했어요. 개발은 Claude(Opus 5.5), 디자인은 Codex(astra6)에게 맡길게요. 경쟁사 조사는 제가 직접 할게요.'],
+    ['agent', 'design'], ['msg', 'pm', 'design', '[디자인] 메인/예약/완료 3화면 시안을 design/ 폴더에. 목표 밖 페이지는 만들지 마.'], ['run', 'design', 'Write – design/main.html'],
+    ['agent', 'dev'], ['msg', 'pm', 'dev', '[개발] 예약 폼과 /api/reserve 구현. 진행 상황은 .team/dev-progress.md에 남겨줘.'], ['run', 'dev', 'Read – package.json'],
     ['msg', 'dev', 'design', '예약 버튼 메인 컬러와 radius 값 알려줄 수 있어요?'],
     ['msg', 'design', 'dev', '메인 #7C5CFF, 버튼 radius 12px, 폰트 Pretendard예요. tokens.css에 정리해 뒀어요.'],
     ['say', 'design', '시안 3장 완성했어요. design/ 폴더 확인해 주세요.'], ['idle', 'design'], ['notify', 'design', 'pm', '작업이 끝났어요', 'finished'],
-    ['run', 'dev', 'Bash – npm test'], ['say', 'dev', '예약 폼과 API 구현 끝. 테스트 12개 통과했어요.'], ['idle', 'dev'], ['notify', 'dev', 'pm', '작업이 끝났어요', 'finished'],
-    ['msg', 'pm', 'dev', '[리뷰] 디자인 시안과 구현 결과를 같이 리뷰해줘. 문제는 목록으로.'], ['run', 'dev', 'Read – design/main.html'],
-    ['msg', 'dev', 'pm', '리뷰 결과: 1) 모바일에서 버튼이 잘림 2) 날짜 미입력 시 500 에러. 2번은 제가 고칠게요, 1번은 디자인 수정이 필요해요.'],
-    ['msg', 'pm', 'design', '모바일 360px에서 예약 버튼이 잘린대요. 시안 수정 부탁해요.'], ['run', 'design', 'Edit – design/main.html'],
-    ['msg', 'design', 'pm', '버튼을 전체 폭으로 바꿨어요.'], ['idle', 'design'], ['say', 'dev', '빈 날짜 검증 추가, 테스트 13개 통과.'], ['idle', 'dev'],
-    ['say', 'pm', '모두 수고했어요! 결과와 남은 일을 사장님께 정리해서 보고할게요.'], ['idle', 'pm']
+    ['quota', 'dev', 'Claude usage limit reached. Resets at 18:00.'], ['notify', 'dev', 'pm', '사용량 한도로 멈췄어요', 'errored'],
+    ['say', 'pm', '개발 Claude가 사용량 초과예요. 사용량이 남은 Codex로 대체해서 멈춘 곳부터 이어갈게요.'],
+    ['agent', 'dev2'], ['msg', 'pm', 'dev2', '[개발·대체] dev-progress.md와 git status 보고 /api/reserve부터 이어서 해줘.'], ['stop', 'dev'], ['run', 'dev2', 'Bash – npm test'],
+    ['say', 'dev2', '예약 폼과 API 구현 끝. 테스트 12개 통과했어요.'], ['idle', 'dev2'], ['notify', 'dev2', 'pm', '작업이 끝났어요', 'finished'],
+    ['agent', 'review'], ['msg', 'pm', 'review', '[리뷰] 목표 기준으로 디자인과 git diff를 검토해서 문제를 목록으로 보내줘.'], ['run', 'review', 'Bash – npm run build'],
+    ['msg', 'review', 'pm', '리뷰 결과: 1) 모바일에서 버튼이 잘림 2) 날짜 미입력 시 500 에러. 제안: 다크 모드(목표 밖)'],
+    ['msg', 'pm', 'design', '모바일 360px에서 예약 버튼이 잘린대요. 시안 수정 부탁해요.'], ['msg', 'pm', 'dev2', '날짜 미입력 시 500 에러 고쳐줘.'], ['run', 'design', 'Edit – design/main.html'],
+    ['msg', 'design', 'pm', '버튼을 전체 폭으로 바꿨어요.'], ['idle', 'design'], ['say', 'dev2', '빈 날짜 검증 추가, 테스트 13개 통과.'], ['idle', 'dev2'], ['idle', 'review'],
+    ['say', 'pm', '목표 완료! 다크 모드는 목표 밖이라 제안으로만 보고할게요.'], ['idle', 'pm']
   ]
   let step = 0, started = 0, agents = [], events = [], seq = 0
   const reset = () => { step = 0; started = Date.now(); agents = []; events = []; seq = 0 }
@@ -508,6 +522,8 @@ const demo = (() => {
       if (k === 'agent') agents.push({ id: r, title: A[r][1], provider: A[r][0], status: 'idle', parentId: r === 'pm' ? null : 'pm', workspaceId: 'demo', cwd: '/workspace/cafe-landing' })
       if (k === 'run') Object.assign(ag(r), { status: 'running', tool: x[0] })
       if (k === 'idle') Object.assign(ag(r), { status: 'idle', tool: null })
+      if (k === 'quota') Object.assign(ag(r), { status: 'error', tool: null, lastError: x[0] })
+      if (k === 'stop') Object.assign(ag(r), { status: 'closed' })
       if (k === 'user') { ag(r).goal = x[0]; events.push({ id: 'e' + ++seq, kind: 'user', from: 'owner', to: r, text: x[0], at }) }
       if (k === 'say') { ag(r).say = x[0]; events.push({ id: 'e' + ++seq, kind: 'say', from: r, text: x[0], at }) }
       if (k === 'msg') events.push({ id: 'e' + ++seq, kind: 'msg', from: r, to: x[0], text: x[1], at })
@@ -522,9 +538,10 @@ const demo = (() => {
 ;(async () => {
   try { const r = await (DEMO ? fetch(`/api/roles?${token}`).then((r) => r.json()).catch(() => null) : api('/api/roles')); if (r) ROLES = { ...ROLES, ...r } } catch {}
   if (!ROLES.roles?.length) ROLES = { ...ROLES, roles: [
-    { id: 'pm', name: 'PM', emoji: '🧭', color: '#7c5cff', provider: 'gemini', match: ['[pm]', '기획'] },
-    { id: 'dev', name: '개발·리뷰', emoji: '💻', color: '#1f9d6b', provider: 'claude', match: ['[개발]', '[리뷰]', '개발', '리뷰'] },
-    { id: 'design', name: '디자이너', emoji: '🎨', color: '#e0598b', provider: 'codex', match: ['[디자인]', '디자인'] }] }
+    { id: 'pm', name: 'PM', emoji: '🧭', color: '#7c5cff', match: ['pm', '기획', '리드'] },
+    { id: 'dev', name: '개발', emoji: '💻', color: '#1f9d6b', match: ['개발', 'dev'] },
+    { id: 'design', name: '디자이너', emoji: '🎨', color: '#e0598b', match: ['디자인', 'design'] },
+    { id: 'qa', name: '리뷰', emoji: '🔍', color: '#3a86d4', match: ['리뷰', 'review', '검토'] }] }
   if (DEMO) $('#demo').textContent = '실제 데이터 보기'
   drawFloor(); tickClock(); setInterval(tickClock, 30000)
   await tick()
